@@ -1,0 +1,34 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Azure Developer CLI local state
+.azure/
+
+# Python environments
+.venv/
+venv/
+env/
+labenv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# macOS
+.DS_Store
+
+# VS Code
+.vscode/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Bicep generated files
+*.jsonc
