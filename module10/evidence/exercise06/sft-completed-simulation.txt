@@ -1,0 +1,328 @@
+Scenario 1 · Supervised Fine-Tuning
+🎒 SFT Fine-Tuning the Adventure Works Trail Guide
+This notebook demonstrates end-to-end Supervised Fine-Tuning (SFT) of gpt-4.1-mini on Microsoft Foundry, applied to our trail gear recommendation agent.
+
+🧭 Agenda
+Dataset & the Format Problem — what inconsistent output looks like and why it matters
+Setup & Install — environment, packages, credentials
+Connect & Upload Files — push training data to Foundry
+Create the SFT Job — configure hyperparameters and submit
+Monitor Training — watch the loss curve live
+Deploy, Test & Evaluate — did format consistency improve?
+Key Takeaways — when SFT is the right choice
+Execute each cell in sequence. Use ⚙ Apply in Section 4 to lock in hyperparameters before submitting.
+
+📋 Section 1: Dataset & the Format Problem
+Adventure Works customers use the trail guide agent to get gear recommendations for upcoming hikes. The agent knows its products well — but its response format is wildly inconsistent:
+
+Sometimes it uses the expected pipe-delimited spec format: Pack: Osprey Stratos 24 | 24L | 1.25 kg | $160 | Denver (5)
+Sometimes it writes free-form prose: "I'd recommend the Osprey Stratos 24 — a great 24L pack at $160…"
+Sometimes it omits fields entirely: "Salomon X Ultra 4 GTX — $189.95"
+The downstream app parses the pipe-separated format to populate product cards, so format inconsistency directly causes broken UI and failed integrations.
+
+✅ Why SFT for This Problem?
+SFT is the right tool when:
+
+There is a single correct output format for a given input
+You can write (or collect) examples of the exact expected output
+The model's knowledge is fine — only its behaviour (formatting) needs to change
+✅ SFT is the right tool when you know exactly what the output should look like and can write it down.
+📦 Training Data Format
+Each record in training.jsonl is a chat conversation that demonstrates the correct format:
+
+{
+  "messages": [
+    {"role": "system",    "content": "You are the Adventure Works gear advisor..."},
+    {"role": "user",      "content": "Gear list for a 3-day rocky trail with heavy load?"},
+    {"role": "assistant", "content": "Pack: Osprey Atmos AG 65 | 65L | 2.0 kg | $340 | Denver (4)\nShoes: Salomon X Ultra 4 GTX | Wide | $189.95 | Boulder (4)\nPoles: Black Diamond Trail Ergo | Adj | $79.95 | Denver (3)\nComplements: blister kit, trekking gaiters"}
+  ]
+}
+🗂 Example: Good vs. Bad Response
+✅ Correct (pipe-delimited spec format)
+Pack: Osprey Stratos 24 | 24L | 1.25 kg | $160 | Denver (5)
+Shoes: Salomon X Ultra 4 GTX | $189.95 | Boulder (4)
+Hydration: Platypus 2L reservoir | $35 | All (★)
+Poles: Black Diamond Trail Ergo | $79.95 | Denver (3)
+Complements: sun hoody, electrolyte tabs
+❌ Incorrect (inconsistent prose)
+For your trail I'd recommend the Osprey Stratos 24 backpack (24 litres, around $160). You'll also want some good shoes — the Salomon X Ultra 4 GTX are solid at $189. Don't forget hydration! A Platypus 2L reservoir costs $35 and is available everywhere.
+▶ Run
+import json, random
+
+# Inspect the SFT gear-format training dataset
+with open("training.jsonl") as f:
+    records = [json.loads(line) for line in f]
+
+print(f"Trail Guide SFT Dataset — {len(records)} examples\n" + "-" * 60)
+for rec in random.sample(records, 3):
+    user_msg  = next(m["content"] for m in rec["messages"] if m["role"] == "user")
+    asst_msg  = next(m["content"] for m in rec["messages"] if m["role"] == "assistant")
+    first_line = asst_msg.split("\n")[0]
+    print(f"User      : {user_msg}")
+    print(f"Assistant : {first_line}…")
+    print("-" * 60)
+Trail Guide SFT Dataset — 450 examples
+------------------------------------------------------------
+User      : Gear list for a 3-day rocky trail with heavy load?
+Assistant : Pack: Osprey Atmos AG 65 | 65L | 2.0 kg | $340 | Denver (4)…
+------------------------------------------------------------
+User      : Compare Merrell Moab 3 vs Salomon X Ultra 4 for rocky trails.
+Assistant : Pack: N/A | — | — | — | — …
+------------------------------------------------------------
+User      : What gear do I need for a winter day hike above 3000m?
+Assistant : Pack: Osprey Talon 22 | 22L | 0.86 kg | $140 | All (★)…
+------------------------------------------------------------
+⚙️ Section 2: Setup & Installation
+Install all required packages. We need:
+
+azure-ai-projects — Microsoft Foundry project client
+azure-ai-evaluation — automated quality metrics
+azure-mgmt-cognitiveservices — deploy the fine-tuned model
+openai — fine-tuning jobs API and inference
+python-dotenv — load environment config from .env
+▶ Run
+pip install -r requirements.txt
+Collecting azure-ai-projects>=2.0.0b1 ... ✅
+Collecting azure-ai-evaluation>=1.13.0 ... ✅
+Collecting azure-mgmt-cognitiveservices ... ✅
+Collecting openai ... ✅
+Collecting python-dotenv ... ✅
+Successfully installed all packages.
+Note: you may need to restart the kernel to use updated packages.
+▶ Run
+import os
+from dotenv import load_dotenv
+from azure.identity import DefaultAzureCredential
+from azure.ai.projects import AIProjectClient
+
+load_dotenv()
+
+endpoint   = os.environ["MICROSOFT_FOUNDRY_PROJECT_ENDPOINT"]
+model_name = os.environ["MODEL_NAME"]           # gpt-4.1-mini
+
+training_file_path   = "training.jsonl"
+validation_file_path = "validation.jsonl"
+
+print("✅ All libraries imported successfully")
+print(f"   Endpoint   : {endpoint[:40]}…")
+print(f"   Model      : {model_name}")
+✅ All libraries imported successfully
+   Endpoint   : https://myproject.api.azureml.ms/…
+   Model      : gpt-4.1-mini
+▶ Run
+# Connect to Microsoft Foundry Project
+# Requires: Azure AI User role on the Foundry project resource
+credential     = DefaultAzureCredential()
+project_client = AIProjectClient(endpoint=endpoint, credential=credential)
+openai_client  = project_client.get_openai_client()
+
+print("✅ Connected to Microsoft Foundry Project")
+✅ Connected to Microsoft Foundry Project
+📤 Section 3: Upload Training Files
+Upload the training and validation JSONL files to Microsoft Foundry. Each file is assigned a unique ID that will be referenced when creating the fine-tuning job.
+
+📋 Tip: If your training data is already in Azure Blob Storage, skip to the optional blob import cell below instead of re-uploading.
+📋 Environment: Copy .env.template to .env and fill in:
+MICROSOFT_FOUNDRY_PROJECT_ENDPOINT, MODEL_NAME, AZURE_SUBSCRIPTION_ID, AZURE_RESOURCE_GROUP, AZURE_AOAI_ACCOUNT
+▶ Run
+print("Uploading training file…")
+with open(training_file_path, "rb") as f:
+    train_file = openai_client.files.create(file=f, purpose="fine-tune")
+
+print("Uploading validation file…")
+with open(validation_file_path, "rb") as f:
+    validation_file = openai_client.files.create(file=f, purpose="fine-tune")
+
+train_file_id = train_file.id
+val_file_id   = validation_file.id
+
+print(f"Training file ID   : {train_file_id}")
+print(f"Validation file ID : {val_file_id}")
+Uploading training file…
+Uploading validation file…
+Training file ID   : file-a1b2c3d4e5f6478a9b0c1d2e3f4a5b6c
+Validation file ID : file-b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4
+⏭ Optional — Import from Azure Blob Storage. If you already uploaded files above (cell 8), skip cells 10–11. Only use this path if your training data lives in Blob Storage.
+📦 Import from Azure Blob Storage (Optional)
+If your training data is already stored in Azure Blob Storage, you can import it directly without re-uploading, using the /openai/files/import preview endpoint.
+
+Prerequisites: Generate SAS tokens with read permissions, then set:
+
+TRAINING_FILE_BLOB_URL=https://<storage>.blob.core.windows.net/<container>/training.jsonl?<sas>
+VALIDATION_FILE_BLOB_URL=https://<storage>.blob.core.windows.net/<container>/validation.jsonl?<sas>
+▶ Run
+import httpx
+
+training_blob_url   = os.environ.get("TRAINING_FILE_BLOB_URL")
+validation_blob_url = os.environ.get("VALIDATION_FILE_BLOB_URL")
+
+if training_blob_url:
+    print("Importing files from Azure Blob Storage…")
+    import_url = f"{endpoint}/openai/files/import?api-version=2025-11-15-preview"
+    token   = credential.get_token("https://ai.azure.com/.default")
+    headers = {"Authorization": f"Bearer {token.token}", "Content-Type": "application/json"}
+
+    with httpx.Client() as client:
+        print("Importing training file…")
+        resp = client.post(import_url, headers=headers, json={
+            "filename": "training.jsonl", "purpose": "fine-tune", "content_url": training_blob_url
+        })
+        resp.raise_for_status()
+        train_file_id = resp.json()["id"]
+        print(f"  Training file imported : {train_file_id}")
+
+        if validation_blob_url:
+            print("Importing validation file…")
+            resp = client.post(import_url, headers=headers, json={
+                "filename": "validation.jsonl", "purpose": "fine-tune", "content_url": validation_blob_url
+            })
+            resp.raise_for_status()
+            val_file_id = resp.json()["id"]
+            print(f"  Validation file imported: {val_file_id}")
+
+    print("Import completed! Files are being processed…")
+else:
+    print("ℹ️  Blob URLs not set — using files uploaded in the previous cell.")
+ℹ️  Blob URLs not set — using files uploaded in the previous cell.
+▶ Run
+# Wait until Foundry has validated and indexed the uploaded files
+print("Waiting for files to be processed…")
+openai_client.files.wait_for_processing(train_file_id)
+openai_client.files.wait_for_processing(val_file_id)
+print("✅ Files ready!")
+Waiting for files to be processed…
+✅ Files ready!
+🚀 Section 4: Create the SFT Job
+With our training data uploaded, we launch a supervised fine-tuning job. The job uses method.type = "supervised" and a suffix that gets appended to the deployed model name.
+
+🎛 SFT Hyperparameters
+Parameter	What it controls
+n_epochs	Full passes through the training data. More epochs → better format retention, but risks overfitting to training examples. Typical range: 1–10.
+batch_size	Examples per gradient step. Smaller = more updates per epoch, often better for format tasks. Typical range: 1–8.
+learning_rate_multiplier	Scales the default learning rate. Too high risks destroying existing knowledge; too low slows format adoption. Typical range: 0.1–2.0.
+🎛 Try it: Adjust the hyperparameters below, click ⚙ Apply, then re-run the job and monitor cells!
+⚙ Apply
+# ⚙️  SFT Hyperparameters — edit these values and click Apply!
+
+method = {
+    "type": "supervised",
+    "supervised": {
+        "hyperparameters": {
+            "n_epochs":                  
+3
+,
+            "batch_size":               
+1
+,
+            "learning_rate_multiplier": 
+1.0
+
+        }
+    }
+}
+
+suffix = "trail-gear-format"
+✅ SFT hyperparameters applied:
+   n_epochs=3 | batch_size=1 | learning_rate_multiplier=1
+   suffix=trail-gear-format
+▶ Run
+print("Creating supervised fine-tuning job…")
+
+fine_tune_job = openai_client.fine_tuning.jobs.create(
+    model=model_name,
+    training_file=train_file_id,
+    validation_file=val_file_id,
+    method=method,
+    extra_body={"trainingType": "Standard"},
+    suffix=suffix
+)
+
+print(f"Fine-tuning job created!")
+print(f"Job ID : {fine_tune_job.id}")
+print(f"Status : {fine_tune_job.status}")
+print(f"Model  : {fine_tune_job.model}")
+Creating supervised fine-tuning job…
+Fine-tuning job created!
+Job ID : ftjob-dth69prh8gn
+Status : pending
+Model  : gpt-4.1-mini
+Method : supervised
+n_epochs=3  batch_size=1  lr_multiplier=1
+Suffix : trail-gear-format
+Type   : Standard
+⏸
+# 📉 Monitor SFT training progress
+job_status = openai_client.fine_tuning.jobs.retrieve(fine_tune_job.id)
+print(f"Status: {job_status.status}")
+
+events = list(openai_client.fine_tuning.jobs.list_events(fine_tune_job.id, limit=10))
+for event in events:
+    print(event.message)
+🏋 Training gpt-4.1-mini with SFT · 3 epoch(s) · batch 1 · lr×1 | 1350 total steps
+Step 393 / 1350
+SFT Training Loss
+🧠 Section 5: Retrieve, Deploy & Test
+Training is complete. We retrieve the fine-tuned model ID, deploy it to Azure OpenAI, and run a quick inference test to verify format consistency has improved.
+
+Did your hyperparameter choices pay off? Run the cells below to find out!
+▶ Run
+completed_job = openai_client.fine_tuning.jobs.retrieve(fine_tune_job.id)
+
+if completed_job.status == "succeeded":
+    fine_tuned_model_id = completed_job.fine_tuned_model
+    print(f"✅ Fine-tuned Model ID: {fine_tuned_model_id}")
+else:
+    print(f"Status: {completed_job.status}")
+▶ Run
+from azure.mgmt.cognitiveservices import CognitiveServicesManagementClient
+from azure.mgmt.cognitiveservices.models import Deployment, DeploymentProperties, DeploymentModel, Sku
+
+deployment_name = "gpt-4.1-mini-trail-gear-sft"
+
+with CognitiveServicesManagementClient(credential=credential,
+        subscription_id=os.environ["AZURE_SUBSCRIPTION_ID"]) as cogsvc:
+    cogsvc.deployments.begin_create_or_update(
+        resource_group_name=os.environ["AZURE_RESOURCE_GROUP"],
+        account_name=os.environ["AZURE_AOAI_ACCOUNT"],
+        deployment_name=deployment_name,
+        deployment=Deployment(
+            sku=Sku(name="GlobalStandard", capacity=50),
+            properties=DeploymentProperties(
+                model=DeploymentModel(format="OpenAI", name=fine_tuned_model_id, version="1"))
+        )
+    ).result()
+print(f"✅ Deployed as: {deployment_name}")
+▶ Run
+# 🔍 Quick inference test: does the model now use the pipe format?
+response = openai_client.responses.create(
+    model=deployment_name,
+    input=[
+        {"role": "system", "content": "You are the Adventure Works gear advisor."},
+        {"role": "user",   "content": "Gear list for a 3-day rocky trail with heavy load?"}
+    ]
+)
+print("Fine-tuned model response:")
+print(response.output_text)
+▶ Run
+from azure.ai.evaluation import evaluate, CoherenceEvaluator, FluencyEvaluator, GroundednessEvaluator
+from openai import AzureOpenAI
+
+eval_model_cfg = {
+    "azure_endpoint":    os.getenv("AZURE_OPENAI_ENDPOINT"),
+    "api_key":           os.getenv("AZURE_OPENAI_KEY"),
+    "azure_deployment":  os.getenv("DEPLOYMENT_NAME"),
+    "api_version":       "2024-08-01-preview",
+}
+
+print(f"Evaluating fine-tuned model: {deployment_name}\n")
+results = evaluate(
+    data="./eval_data.jsonl",
+    evaluators={
+        "coherence":     CoherenceEvaluator(model_config=eval_model_cfg),
+        "fluency":       FluencyEvaluator(model_config=eval_model_cfg),
+        "groundedness": GroundednessEvaluator(model_config=eval_model_cfg),
+    },
+    output_path="./eval_results_sft"
+)
+🎯 Key Takeaways
+Run the training and evaluation cells above to see your results, then this section will summarise what you learned.
