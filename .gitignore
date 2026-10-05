@@ -32,3 +32,18 @@ __pycache__/
 
 # Bicep generated files
 *.jsonc
+
+# Module 10 local-only files
+.DS_Store
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.azure/
+*.backup
+*.backup.*
+module10/infra/main.json
+module10/infra/core/ai/ai-project.json

@@ -1,0 +1,361 @@
+Scenario 3 · Reinforcement Fine-Tuning
+🏔 Reinforcement Fine-Tuning the Adventure Works Trail Guide
+🧭 Agenda
+This notebook walks through end-to-end Reinforcement Fine-Tuning (RFT) using o4-mini on Azure OpenAI, applied to our trail recommendation agent:
+
+Dataset & Objective — multi-constraint trail planning problems
+System Prompt, Schema & Grader — defining what "good" looks like
+Evaluating Base Models — establish a baseline before fine-tuning
+RFT Training: Setup, Launch & Monitoring — adjust hyperparameters and rerun!
+Results & Comparison — did fine-tuning help?
+Key Takeaways — when to use RFT
+🧮 Section 1: Dataset & Objective
+We use a dataset of complex trail-planning problems from Adventure Works. Each example includes multiple constraints that must all be satisfied in the model's recommendation.
+
+Each example contains:
+
+A planning scenario (e.g. group size, fitness levels, trip duration)
+A set of constraints (child-friendly, medical limitations, gear requirements)
+The model must produce a structured itinerary with safety notes
+Example:
+Plan a 4-day moderate loop. Group: 8 hikers (beginner + intermediate). Child age 7. Max 12 miles/day.
+
+🧠 Why This Is a Perfect Fit for RFT
+This task is not ideal for SFT because:
+
+There are many valid itinerary paths for any given scenario
+Correctness is easy to grade but hard to prescribe as a single label
+We want the model to satisfy all constraints simultaneously — reward-based learning does this naturally
+✅ RFT lets the model explore solutions and learn from a grader — without requiring exact output labels.
+▶ Run
+from datasets import load_dataset
+import random, json
+
+# Load Adventure Works trail planning dataset
+dataset = load_dataset("adventureworks/trail-planning-rft", split="train")
+
+print("🏔 Trail Planning Dataset Samples\n" + "-" * 40)
+for i in random.sample(range(len(dataset)), 5):
+    item = dataset[i]
+    print(f"Scenario  : {item['scenario']}")
+    print(f"Constraints: {item['constraints']}")
+    print("-" * 40)
+🧩 Section 2: System Prompt, Response Schema & Grader Setup
+To enable RFT, we configure three key components:
+
+A system prompt guiding the model to produce structured trail plans
+A response schema enforcing JSON output format
+A model-based grader scoring each completion 0–5
+🎯 Grader Scoring Rubric
+Score	Description
+5	All constraints addressed, safe, logical sequencing, appropriate difficulty
+4	Minor gap — one constraint partially addressed or vague safety note
+3	Two constraints partially addressed, or itinerary has a logical gap
+2	Multiple constraints missed but basic structure is present
+1	Major issues — missing safety plan or ignores key constraints
+0	Invalid output, ignores scenario, or unsafe recommendation
+▶ Run
+# 💬 System Prompt used during RFT training and evaluation
+instruction = (
+    "You are an expert Adventure Works trail guide. "
+    "Given a trail planning scenario and a set of constraints, "
+    "produce a structured recommendation that satisfies ALL constraints.\n\n"
+    "- Address every constraint explicitly in your plan.\n"
+    "- Include: itinerary, gear_list, safety_notes, difficulty_rating.\n"
+    "- Return only a valid JSON object with the following schema.\n"
+    "- If any constraint cannot be fully met, explain why in safety_notes.\n\n"
+    "Example: scenario='Solo 14er weekend', constraints=['altitude_safety']\n"
+    "Output: {\"itinerary\":[...], \"gear_list\":[...], \"safety_notes\":\"...\", \"difficulty_rating\":\"hard\"}"
+)
+✅ System prompt defined (length: 512 chars)
+▶ Run
+# 📦 JSON Schema enforcing structured trail plan output
+response_schema = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "trail_recommendation",
+        "schema": {
+            "type": "object",
+            "required": ["itinerary", "gear_list", "safety_notes", "difficulty_rating"],
+            "properties": {
+                "itinerary": {"type": "array", "description": "Day-by-day plan"},
+                "gear_list": {"type": "array", "description": "Required equipment"},
+                "safety_notes": {"type": "string"},
+                "difficulty_rating": {"type": "string", "enum": ["easy", "moderate", "hard"]}
+            },
+            "additionalProperties": False
+        },
+        "strict": True
+    }
+}
+✅ Response schema defined — 4 required fields: itinerary, gear_list, safety_notes, difficulty_rating
+▶ Run
+# 🎯 Custom Model-Based Grader (o3-mini) for RFT
+custom_grader = {
+    "name": "trail_plan_grader",
+    "type": "score_model",
+    "model": "o3-mini",
+    "input": [
+        {
+            "role": "developer",
+            "content": (
+                "You are an expert trail guide evaluator. Given a planning scenario, "
+                "its constraints, and a model-generated recommendation, score the response 0-5.\n\n"
+                "Scoring: 5=all constraints addressed + safe + logical; "
+                "4=minor gap; 3=partial; 2=multiple gaps; 1=major issues; 0=invalid/unsafe.\n"
+                "Output: Score: <0-5>\nReasoning: <brief>"
+            )
+        },
+        {
+            "role": "user",
+            "content": '{"scenario": {{item.scenario}}, "constraints": {{item.constraints}}, "response": {{sample.output_text}}}'
+        }
+    ],
+    "pass_threshold": 5,
+    "range": [0.0, 5.0]
+}
+✅ Custom grader configured
+{'name': 'trail_plan_grader',
+ 'type': 'score_model',
+ 'model': 'o3-mini',
+ 'pass_threshold': 5,
+ 'range': [0.0, 5.0]}
+📊 Section 3: Evaluating Base Models
+Before fine-tuning, we benchmark how existing models handle multi-constraint trail planning using our custom grader.
+
+We compare: o3, o4-mini, gpt-4.1, gpt-4.1-mini
+
+Metric	Description
+Pass %	% of completions scoring at or above the pass threshold (5/5)
+Error %	% of completions that failed structurally (malformed output)
+▶ Run
+from scripts.io_utils import upload_file
+from scripts.dataset_utils import save_dataset_in_eval_format
+
+# Use 100 test examples for evaluation
+test_dataset = load_dataset("adventureworks/trail-planning-rft", split="test")
+eval_ready_path = "data/trail_eval_100.jsonl"
+
+save_dataset_in_eval_format(test_dataset, eval_ready_path, max_records=100)
+eval_file_id = await upload_file("trail_eval_100.jsonl", eval_ready_path, purpose="evals")
+print(f"✅ Eval file ID: {eval_file_id}")
+✅ Saved 100 records to data/trail_eval_100.jsonl
+Using Azure API for file upload...
+✅ Eval file ID: file-a3f9b821cc2e4d5e8b1f3a7c09d4e612
+▶ Run
+from scripts.eval_utils import create_eval, create_eval_run
+
+eval_id = await create_eval("trail-base-eval", grader_model="o3-mini", pass_threshold=5)
+print(f"📊 Evaluation created: {eval_id}")
+
+RUN_MODELS = ["o3", "o4-mini", "gpt-4.1", "gpt-4.1-mini"]
+for model in RUN_MODELS:
+    await create_eval_run(eval_id, eval_file_id, model, system_prompt=instruction)
+print(f"🚀 Evaluation runs launched for: {', '.join(RUN_MODELS)}")
+Evaluation created successfully with ID: eval_trail_c9a284f5e13b
+📊 Evaluation created: eval_trail_c9a284f5e13b
+Create Eval Run Status for o3: 201
+Create Eval Run Status for o4-mini: 201
+Create Eval Run Status for gpt-4.1: 201
+Create Eval Run Status for gpt-4.1-mini: 201
+🚀 Evaluation runs launched for: o3, o4-mini, gpt-4.1, gpt-4.1-mini
+▶ Run
+from scripts.eval_utils import display_evaluation_summary
+await display_evaluation_summary([eval_id])
+================================================
+Base Model Evaluation Summary
+================================================
+Model          Status     Pass %   Error %
+----------------------------------------------
+o3             completed  94.0%    0.0%
+o4-mini        completed  71.0%    0.0%
+gpt-4.1        completed   8.0%    0.0%
+gpt-4.1-mini   completed   3.0%    0.0%
+================================================
+Base Model Pass Rate (%) — Multi-Constraint Trail Planning
+o3
+94%
+o4-mini (base)
+71%
+gpt-4.1
+8%
+gpt-4.1-mini
+3%
+💡 o4-mini at 71% is the best candidate for RFT — it has a good base but clear room για improvement on constraint satisfaction.
+
+🚀 Section 4: RFT Training — Setup, Launch & Monitoring
+With our system prompt, schema, and grader defined, we fine-tune o4-mini using RFT on just 100 training examples.
+
+🧪 RFT is Sample-Efficient by Design
+Each training example includes a prompt with embedded scenario + constraints. The grader scores the model's completions, providing reward signal — no ground-truth labels needed.
+
+🎛 Try it: Adjust the hyperparameters in the cell below, then re-run the training cells to see how they affect the reward curve and final pass rate!
+▶ Run
+from scripts.dataset_utils import convert_to_rft_dataset
+
+train_rft_path = "data/trail_train_100.jsonl"
+valid_rft_path = "data/trail_valid_50.jsonl"
+
+convert_to_rft_dataset(train_raw, train_rft_path, instruction, max_records=100)
+convert_to_rft_dataset(valid_raw, valid_rft_path, instruction, max_records=50)
+
+print(f"✅ Train set saved to: {train_rft_path}")
+print(f"✅ Validation set saved to: {valid_rft_path}")
+
+# Preview one sample record
+with open(train_rft_path) as f:
+    sample = json.loads(f.readline())
+print("\n📝 Sample RFT Training Record:\n")
+print(json.dumps(sample, indent=2))
+✅ Converted 100 records to RFT format → data/trail_train_100.jsonl
+✅ Converted 50 records to RFT format → data/trail_valid_50.jsonl
+✅ Train set saved to: data/trail_train_100.jsonl
+✅ Validation set saved to: data/trail_valid_50.jsonl
+
+📝 Sample RFT Training Record:
+
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "You are an Adventure Works trail guide...\nPlan a 4-day moderate loop.\nScenario: \"4-day moderate loop, group 8, child age 7\"\nConstraints: \"['child_friendly', 'varied_fitness', 'gear_list_required']\""
+    }
+  ],
+  "scenario": "4-day moderate loop, group 8, child age 7",
+  "constraints": "['child_friendly', 'varied_fitness', 'gear_list_required']"
+}
+▶ Run
+# ☁️ Upload train and validation sets to Azure OpenAI
+train_file_id = await upload_file("trail_train_100.jsonl", train_rft_path, purpose="fine-tune")
+valid_file_id = await upload_file("trail_valid_50.jsonl", valid_rft_path, purpose="fine-tune")
+
+print(f"📤 Train  File ID : {train_file_id}")
+print(f"📤 Valid  File ID : {valid_file_id}")
+Using Azure API for file upload...
+✅ File 'trail_train_100.jsonl' uploaded successfully.
+Using Azure API for file upload...
+✅ File 'trail_valid_50.jsonl' uploaded successfully.
+📤 Train  File ID : file-d7e3f09ab14c4b8da3f250e18c6a9b1
+📤 Valid  File ID : file-94b1c23de50a4f9cb7e60d17fa5b2c8
+⚙ Apply
+# ⚙️  RFT Hyperparameters — edit these values and click Apply!
+
+method = {
+    "type": "reinforcement",
+    "reinforcement": {
+        "hyperparameters": {
+            "n_epochs":              
+2
+,
+            "batch_size":            
+4
+,
+            "eval_interval":        5,
+            "eval_samples":          2,
+            "reasoning_effort":      
+medium
+,
+            "learning_rate_multiplier": 
+2
+
+        },
+        "grader": custom_grader,
+        "response_format": response_schema
+    }
+}
+✅ Hyperparameters applied:
+   n_epochs=2 | batch_size=4 | reasoning_effort=medium | lr_multiplier=2
+▶ Run
+from openai import OpenAI
+
+client = OpenAI(base_url=AZURE_API_ENDPOINT, api_key=AZURE_API_KEY)
+
+finetune_job = client.fine_tuning.jobs.create(
+    model="o4-mini-2025-04-16",
+    training_file=train_file_id,
+    validation_file=valid_file_id,
+    method=method,
+    suffix="trail-guide-rft"
+)
+print(f"Fine-tuning job submitted. Job ID: {finetune_job.id}")
+Fine-tuning job submitted. Job ID: ftjob-8plisx9l0hv
+Status   : queued
+Model    : o4-mini-2025-04-16
+Suffix   : trail-guide-rft
+n_epochs : 2
+batch_size: 4
+reasoning_effort: medium
+lr_multiplier: 2
+▶ Run
+# 📈 Monitor training reward curve
+from scripts.ft_utils import stream_training_events
+
+async for event in stream_training_events(finetune_job.id):
+    print(event)
+🚂 Training o4-mini with RFT · 2 epoch(s) · batch 4 · medium reasoning effort
+Step 50 / 50
+Training Reward
+✅ Training complete! Final train reward: 4.49/5.0 · Model deploying…
+🧠 Section 5: Evaluating the Fine-Tuned Model & Comparing Results
+The fine-tuned model is now deployed. We evaluate it on the same 100-example test set with the same grader and compare pass rates.
+
+Did our hyperparameter choices pay off? Run the cells below to find out!
+▶ Run
+from scripts.eval_utils import create_eval, create_eval_run
+
+ft_eval_id = await create_eval("trail-ft-eval", grader_model="o3-mini", pass_threshold=5)
+print(f"📊 Evaluation created: {ft_eval_id}")
+
+ft_deployment = "o4-mini-2025-04-16-trail-guide-rft"
+await create_eval_run(ft_eval_id, eval_file_id, ft_deployment, system_prompt=instruction)
+print(f"🚀 Evaluation launched for: {ft_deployment}")
+Evaluation created successfully with ID: eval_trail_ft_5n67rw0j
+📊 Evaluation created: eval_trail_ft_5n67rw0j
+Create Eval Run Status for o4-mini-2025-04-16-trail-guide-rft: 201
+🚀 Evaluation launched for: o4-mini-2025-04-16-trail-guide-rft
+▶ Run
+from scripts.eval_utils import display_evaluation_summary
+await display_evaluation_summary([eval_id, ft_eval_id])
+================================================
+Combined Evaluation Summary
+================================================
+Model                  Status     Pass %   Error %
+------------------------------------------------------
+o3                     completed   94.0%    0.0%
+ft:o4-mini (your run)  completed   89.0%    0.0%   ← NEW
+o4-mini (base)         completed   71.0%    0.0%
+gpt-4.1                completed    8.0%    0.0%
+gpt-4.1-mini           completed    3.0%    0.0%
+================================================
+📈 ft:o4-mini improved by +18.0% over baseline
+Comparison: Pass Rate (%) — After RFT with your hyperparameters
+o3
+94%
+ft:o4-mini (your run)
+89.0%
+o4-mini (base)
+71%
+gpt-4.1
+8%
+gpt-4.1-mini
+3%
+🎯 Key Takeaways
+Your run: n_epochs=2 · batch_size=4 · reasoning_effort=medium · lr_multiplier=2
+
+Result: ft:o4-mini reached 89.0% pass rate — an improvement of +18.0% over the base model.
+
+🌟 Outstanding! You got within 5.0% of o3 — at a fraction of the inference cost.
+
+Why RFT Worked
+No labels required — the model learned from reward scores alone
+Multiple valid answers — RFT handled itinerary ambiguity better than SFT
+Constraint satisfaction enforced by reward — not hardcoded rules
+Lightweight — trained on just 100 examples with clear gains
+💡 Hyperparameter Insights
+Parameter	Your choice	Impact
+n_epochs	2	Conservative — good for small datasets
+batch_size	4	Optimal — stable gradient estimates
+reasoning_effort	medium	Good balance of quality and cost
+lr_multiplier	2	Optimal — good convergence speed
+🔁 Try It Again
+Go back to the hyperparameter cell, adjust the values, click ⚙ Apply, then re-run cells 15 → 16 → 18 → 19 to compare different configurations!

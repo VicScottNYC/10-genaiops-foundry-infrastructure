@@ -932,3 +932,8 @@ Conditional Azure Dependencies
 ```
 
 The result is a reusable, parameterized Microsoft Foundry infrastructure architecture that can serve as the platform foundation for subsequent generative AI development and operational workflows.
+
+
+## Module 10 Exercises 1–6
+
+The [exercise archive and verification checklist](module10/README.md) includes agent prompts, evaluation code and datasets, monitoring scripts, and completed fine-tuning simulation transcripts. See the checklist for evidence gaps.
